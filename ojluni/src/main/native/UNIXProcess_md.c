@@ -40,6 +40,7 @@
  * Platform-specific support for java.lang.Process
  */
 #include <assert.h>
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdlib.h>
 #include <sys/types.h>
@@ -963,6 +964,76 @@ UNIXProcess_forkAndExec(JNIEnv *env,
         if ((penvBlock = getBytes(env, envBlock))   == NULL) goto Catch;
         if ((c->envv = NEW(const char *, envc + 1)) == NULL) goto Catch;
         initVectorFromBlock(c->envv, penvBlock, envc);
+    }
+
+    /*
+     * Android's ProcessBuilder supplies an environment block built from Java's
+     * process environment, which can predate Zygote specialization. Preserve
+     * the native environment markers set while specializing this process;
+     * libc consumes them in the new process before applying its filters.
+     */
+    const char *privacy_state = getenv("BIONIC_AX_SANDBOX_PRIVACY");
+    const char *adb_state = getenv("BIONIC_AX_SANDBOX_ADB");
+    const char *selinux_state = getenv("BIONIC_AX_SANDBOX_SELINUX_ENFORCING");
+    const bool propagate_privacy =
+            privacy_state != NULL && strcmp(privacy_state, "1") == 0;
+    const bool propagate_adb =
+            adb_state != NULL && strcmp(adb_state, "1") == 0;
+    const bool propagate_selinux =
+            selinux_state != NULL && strcmp(selinux_state, "1") == 0;
+
+    if (propagate_privacy || propagate_adb || propagate_selinux) {
+        static const char privacy_marker[] = "BIONIC_AX_SANDBOX_PRIVACY=1";
+        static const char privacy_prefix[] = "BIONIC_AX_SANDBOX_PRIVACY=";
+        static const char adb_marker[] = "BIONIC_AX_SANDBOX_ADB=1";
+        static const char adb_prefix[] = "BIONIC_AX_SANDBOX_ADB=";
+        static const char selinux_marker[] = "BIONIC_AX_SANDBOX_SELINUX_ENFORCING=1";
+        static const char selinux_prefix[] = "BIONIC_AX_SANDBOX_SELINUX_ENFORCING=";
+        const char *const *source_env = c->envv != NULL
+                ? c->envv : (const char *const *) environ;
+        int source_count = 0;
+        while (source_env[source_count] != NULL) ++source_count;
+
+        const char **propagated_env = NEW(const char *, source_count + 4);
+        if (propagated_env == NULL) goto Catch;
+        bool privacy_present = false;
+        bool adb_present = false;
+        bool selinux_present = false;
+        int propagated_count = 0;
+        for (int i = 0; i < source_count; ++i) {
+            const char *entry = source_env[i];
+            if (strncmp(entry, privacy_prefix, sizeof(privacy_prefix) - 1) == 0) {
+                privacy_present = true;
+                if (propagate_privacy) {
+                    propagated_env[propagated_count++] = privacy_marker;
+                }
+            } else if (strncmp(entry, adb_prefix, sizeof(adb_prefix) - 1) == 0) {
+                adb_present = true;
+                if (propagate_adb) {
+                    propagated_env[propagated_count++] = adb_marker;
+                }
+            } else if (strncmp(entry, selinux_prefix,
+                               sizeof(selinux_prefix) - 1) == 0) {
+                selinux_present = true;
+                if (propagate_selinux) {
+                    propagated_env[propagated_count++] = selinux_marker;
+                }
+            } else {
+                propagated_env[propagated_count++] = entry;
+            }
+        }
+        if (propagate_privacy && !privacy_present) {
+            propagated_env[propagated_count++] = privacy_marker;
+        }
+        if (propagate_adb && !adb_present) {
+            propagated_env[propagated_count++] = adb_marker;
+        }
+        if (propagate_selinux && !selinux_present) {
+            propagated_env[propagated_count++] = selinux_marker;
+        }
+        propagated_env[propagated_count] = NULL;
+        free(c->envv);
+        c->envv = propagated_env;
     }
 
     if (dir != NULL) {
